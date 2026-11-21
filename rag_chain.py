@@ -1,8 +1,19 @@
+import sys
+
+# Streamlit Cloud / Linux ships an older system sqlite3; swap in pysqlite3 if installed.
+try:
+    __import__("pysqlite3")
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except ImportError:
+    pass
+
 import json
 import os
 import re
+import threading
 import time
 from collections import Counter
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -20,167 +31,121 @@ from openai import (
     RateLimitError,
 )
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-CHROMA_DIR = "./chroma_durgeshnandini"
-CACHE_FILE = "./durgeshnandini_chapters.json"
-EMBEDDING_MODEL = "intfloat/multilingual-e5-base"
 
-API_KEY = os.getenv("API_KEY", "").strip()
-BASE_URL = os.getenv("BASE_URL", "https://api.cheaperinference.com/v1").strip()
-# Set ONLY_FREE=true in .env if you want to rotate strictly among Free models
-ONLY_FREE = os.getenv("ONLY_FREE", "false").strip().lower() == "true"
+def _get_config(key: str, default: str = "") -> str:
+    """Reads config from environment variables (.env) first, then Streamlit st.secrets."""
+    val = os.getenv(key)
+    if val is not None and str(val).strip():
+        return str(val).strip()
+    try:
+        import streamlit as st
 
-# Highest-discount text models from CheaperInference (Free first, then highest % off)
-# Note: parallel-decisions-fast is excluded because it is a Decision-only model, not Text/Chat.
-HIGHEST_DISCOUNT_FALLBACK_MODELS = [
-    ("beam-free", 30.0),                    # Free
-    ("nemotron-3.5-lightning-free", 30.0),  # Free
-    ("deepseek-v4.1-flash-1017", 56.0),      # 56.00% off
-    ("longcat-2.5", 64.0),                   # 64.00% off
-    ("gpt-5.6-luna", 60.0),                  # 60.00% off
-    ("gpt-5.6-terra", 60.0),                 # 60.00% off
-    ("gpt-oss-120b", 60.0),                 # 60.00% off
-    ("flint-v1.0", 30.0),                   # Free
-    ("glyph-cluster", 30.0),                # Free
-    ("ampersand-v0.1", 30.0)                # Free
+        if key in st.secrets:
+            secret_val = st.secrets[key]
+            if secret_val is not None and str(secret_val).strip():
+                return str(secret_val).strip()
+    except Exception:
+        pass
+    return default
+
+
+_raw_chroma_dir = _get_config("CHROMA_DIR", "")
+CHROMA_DIR = (
+    str(Path(_raw_chroma_dir))
+    if _raw_chroma_dir and Path(_raw_chroma_dir).is_absolute()
+    else str(BASE_DIR / (_raw_chroma_dir or "chroma_durgeshnandini"))
+)
+CACHE_FILE = BASE_DIR / _get_config("CACHE_FILE", "durgeshnandini_chapters.json")
+EMBEDDING_MODEL = _get_config("EMBEDDING_MODEL", "intfloat/multilingual-e5-base")
+
+# Strictly allow ONLY these 4 models (ordered by highest discount first: 60% -> 56%)
+ALLOWED_MODELS = [
+    ("deepseek-v4.1-flash-1017", 70.0),  # 70.00% off
+    ("gpt-5.6-luna", 60.0),              # 60.00% off
+    ("gpt-5.6-terra", 60.0),             # 60.00% off
+    ("gpt-oss-120b", 60.0),              # 60.00% off
 ]
 
-NON_CHAT_KEYWORDS = (
-    "embed", "rerank", "whisper", "tts", "dall-e", "flux", "sdxl",
-    "moderation", "audio", "video", "image", "transcrib", "decision", "retrieval",
-)
-
-# How long to skip an exhausted/rate-limited model before retrying it (seconds)
 MODEL_COOLDOWN_SECONDS = 900
 
 _VECTORSTORE = None
+_VECTORSTORE_LOCK = threading.Lock()
 _CACHED_CHAPTERS = None
 _RANKED_MODELS = None
 _EXHAUSTED_MODELS: dict[str, float] = {}
 
 
-def _is_text_chat_model(model_id: str, meta: dict) -> bool:
-    lower_id = model_id.lower()
-    if any(kw in lower_id for kw in NON_CHAT_KEYWORDS):
-        return False
-
-    # Check optional capability/type metadata returned by the provider
-    model_type = str(meta.get("type", "") or meta.get("category", "")).lower()
-    if model_type and model_type not in ("text", "chat", "llm", "completion", "model"):
-        return False
-
-    caps = meta.get("capabilities") or meta.get("modalities")
-    if isinstance(caps, list) and caps:
-        cap_strs = {str(c).lower() for c in caps}
-        if not cap_strs.intersection({"text", "chat", "completion"}):
-            return False
-
-    return True
+def get_api_key() -> str:
+    return _get_config("API_KEY", "")
 
 
-def _extract_discount_score(model_id: str, meta: dict, fallback_scores: dict[str, float]) -> float:
-    """Returns discount percentage (100.0 for Free, 0.0-99.9 for discounted paid models)."""
-    lower_id = model_id.lower()
-    if meta.get("free") is True or meta.get("is_free") is True or "free" in lower_id:
-        return 100.0
-
-    # Check pricing fields if the API returns them
-    pricing = meta.get("pricing") if isinstance(meta.get("pricing"), dict) else {}
-    in_price = pricing.get("prompt", pricing.get("input", meta.get("input_price")))
-    out_price = pricing.get("completion", pricing.get("output", meta.get("output_price")))
-    if in_price is not None and out_price is not None:
-        try:
-            if float(in_price) == 0.0 and float(out_price) == 0.0:
-                return 100.0
-        except (TypeError, ValueError):
-            pass
-
-    # Check explicit discount fields if returned by the API
-    for key in ("discount", "discount_percent", "discount_pct", "discount_percentage"):
-        val = meta.get(key)
-        if val is None:
-            continue
-        if isinstance(val, str):
-            if "free" in val.lower():
-                return 100.0
-            m = re.search(r"(\d+(?:\.\d+)?)", val)
-            if m:
-                num = float(m.group(1))
-                return num * 100.0 if 0 < num <= 1.0 else num
-        elif isinstance(val, (int, float)):
-            return float(val) * 100.0 if 0 < float(val) <= 1.0 else float(val)
-
-    return fallback_scores.get(model_id, -1.0)
+def get_base_url() -> str:
+    return _get_config("BASE_URL", "https://api.cheaperinference.com/v1")
 
 
 def get_ranked_models(force_refresh: bool = False) -> list[str]:
     """
-    Auto-loads text models from BASE_URL/models and sorts them by highest discount
-    (Free first, then highest % discount). Falls back to HIGHEST_DISCOUNT_FALLBACK_MODELS
-    if /models does not expose discount metadata or is unreachable.
+    Returns ONLY the models defined in ALLOWED_MODELS, sorted by highest discount first.
+    Optionally checks /models to filter out any temporarily unlisted model IDs.
     """
     global _RANKED_MODELS
     if _RANKED_MODELS is not None and not force_refresh:
         return _RANKED_MODELS
 
-    fallback_scores = dict(HIGHEST_DISCOUNT_FALLBACK_MODELS)
-    fallback_order = {mid: i for i, (mid, _) in enumerate(HIGHEST_DISCOUNT_FALLBACK_MODELS)}
+    sorted_allowed = sorted(
+        enumerate(ALLOWED_MODELS),
+        key=lambda item: (-item[1][1], item[0]),
+    )
+    ordered_ids = [mid for _, (mid, _) in sorted_allowed]
+    allowed_lookup = {mid.lower(): mid for mid in ordered_ids}
 
-    live_models: list[tuple[str, dict]] = []
+    api_key = get_api_key()
+    base_url = get_base_url()
+
     try:
         resp = requests.get(
-            f"{BASE_URL.rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {API_KEY}"},
+            f"{base_url.rstrip('/')}/models",
+            headers={"Authorization": f"Bearer {api_key}"},
             timeout=15,
         )
         resp.raise_for_status()
         payload = resp.json()
         raw_list = payload.get("data", payload) if isinstance(payload, dict) else payload
+
         if isinstance(raw_list, list):
+            live_allowed = set()
             for item in raw_list:
                 if isinstance(item, dict) and item.get("id"):
-                    mid = str(item["id"]).strip()
-                    if _is_text_chat_model(mid, item):
-                        live_models.append((mid, item))
+                    mid = str(item["id"]).strip().lower()
+                    if mid in allowed_lookup:
+                        live_allowed.add(allowed_lookup[mid])
+
+            if live_allowed:
+                _RANKED_MODELS = [mid for mid in ordered_ids if mid in live_allowed]
     except Exception as e:
-        print(f"Could not fetch live /models list ({e}); using built-in highest-discount list.", flush=True)
-
-    if live_models:
-        scored = []
-        for mid, meta in live_models:
-            discount = _extract_discount_score(mid, meta, fallback_scores)
-            if ONLY_FREE and discount < 100.0:
-                continue
-            # Sort by: highest discount DESC, known dashboard order ASC, model name ASC
-            scored.append((discount, fallback_order.get(mid, 9999), mid))
-
-        scored.sort(key=lambda x: (-x[0], x[1], x[2]))
-        _RANKED_MODELS = [mid for _, _, mid in scored]
+        print(f"Could not fetch live /models list ({e}); using ALLOWED_MODELS directly.", flush=True)
 
     if not _RANKED_MODELS:
-        _RANKED_MODELS = [
-            mid for mid, disc in HIGHEST_DISCOUNT_FALLBACK_MODELS
-            if not ONLY_FREE or disc >= 100.0
-        ]
+        _RANKED_MODELS = ordered_ids
 
-    print(f"Auto-selected model priority (highest discount first): {_RANKED_MODELS[:6]}...", flush=True)
+    print(f"Active model priority: {_RANKED_MODELS}", flush=True)
     return _RANKED_MODELS
 
 
 def get_available_models() -> list[str]:
-    """Returns ranked models skipping any currently in cooldown after token exhaustion."""
+    """Returns allowed models skipping any currently in cooldown after errors/exhaustion."""
     ranked = get_ranked_models()
     now = time.time()
 
-    # Clear expired cooldowns
     expired = [m for m, ts in _EXHAUSTED_MODELS.items() if now - ts >= MODEL_COOLDOWN_SECONDS]
     for m in expired:
         del _EXHAUSTED_MODELS[m]
 
     available = [m for m in ranked if m not in _EXHAUSTED_MODELS]
     if not available:
-        # All models were exhausted; reset cooldowns and try from the top again
         _EXHAUSTED_MODELS.clear()
         available = list(ranked)
     return available
@@ -191,28 +156,84 @@ def mark_model_exhausted(model_name: str, reason: str):
     print(f"Switching away from '{model_name}' ({reason}). Choosing next model...", flush=True)
 
 
+def get_cached_chapters() -> list[dict]:
+    global _CACHED_CHAPTERS
+    if _CACHED_CHAPTERS is None and CACHE_FILE.exists():
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            _CACHED_CHAPTERS = json.load(f)
+    return _CACHED_CHAPTERS or []
+
+
+def _build_documents_from_chapters(chapters: list[dict]) -> list[Document]:
+    """Creates passage-prefixed chunks from cached chapters if ChromaDB needs initialization."""
+    docs: list[Document] = []
+    for idx, ch in enumerate(chapters, start=1):
+        paragraphs = [p.strip() for p in ch.get("text", "").split("\n\n") if p.strip()]
+        chapter_title = ch.get("chapter", f"পরিচ্ছেদ {idx}")
+        source_url = ch.get("source_url", "")
+
+        if not paragraphs:
+            continue
+
+        step = 2
+        window_size = 3
+        for i in range(0, len(paragraphs), step):
+            chunk_text = "\n\n".join(paragraphs[i : i + window_size])
+            docs.append(
+                Document(
+                    page_content=f"passage: [{chapter_title}]\n{chunk_text}",
+                    metadata={
+                        "chapter": chapter_title,
+                        "chapter_num": idx,
+                        "source_url": source_url,
+                    },
+                )
+            )
+            if i + window_size >= len(paragraphs):
+                break
+    return docs
+
+
 def get_vectorstore():
     global _VECTORSTORE
-    if _VECTORSTORE is None:
+    if _VECTORSTORE is not None:
+        return _VECTORSTORE
+
+    with _VECTORSTORE_LOCK:
+        if _VECTORSTORE is not None:
+            return _VECTORSTORE
+
         embeddings = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL,
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True},
         )
-        _VECTORSTORE = Chroma(
+        vs = Chroma(
             persist_directory=CHROMA_DIR,
             embedding_function=embeddings,
             collection_name="durgeshnandini",
         )
+
+        try:
+            existing_count = vs._collection.count()
+        except Exception:
+            existing_count = 0
+
+        if existing_count == 0:
+            chapters = get_cached_chapters()
+            if chapters:
+                print("ChromaDB empty/missing; building index from durgeshnandini_chapters.json...", flush=True)
+                docs = _build_documents_from_chapters(chapters)
+                if docs:
+                    vs.add_documents(docs)
+            else:
+                raise FileNotFoundError(
+                    f"Neither '{CHROMA_DIR}' nor '{CACHE_FILE}' was found. "
+                    "Ensure at least one is committed to your repository."
+                )
+
+        _VECTORSTORE = vs
     return _VECTORSTORE
-
-
-def get_cached_chapters() -> list[dict]:
-    global _CACHED_CHAPTERS
-    if _CACHED_CHAPTERS is None and os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            _CACHED_CHAPTERS = json.load(f)
-    return _CACHED_CHAPTERS or []
 
 
 STOPWORDS = {
@@ -240,7 +261,7 @@ def extract_bengali_keywords(text: str, top_k: int = 10) -> list[str]:
 def diverse_keyword_search(keywords: list[str], max_per_chapter: int = 1, top_n: int = 6) -> list[Document]:
     """
     Searches cached chapters with a strict per-chapter cap so one chapter
-    (e.g. ষোড়শ পরিচ্ছেদ: শৈলেশ্বর-সাক্ষাৎ) cannot drown out earlier chapters.
+    cannot drown out earlier chapters.
     """
     chapters = get_cached_chapters()
     if not chapters or not keywords:
@@ -284,11 +305,9 @@ def retrieve_relevant_docs(question: str, k: int = 12) -> list[Document]:
     vectorstore = get_vectorstore()
     q_keywords = extract_bengali_keywords(question, top_k=8)
 
-    # Hop 1: Diverse multi-chapter keyword + dense retrieval
     kw_docs = diverse_keyword_search(q_keywords, max_per_chapter=1, top_n=5)
     raw_dense = vectorstore.similarity_search(f"query: {question}", k=k)
 
-    # Hop 2: Find frequent proper nouns/terms in Hop 1 and pull their cross-chapter context
     hop1_text = "\n".join(d.page_content for d in kw_docs + raw_dense[:4])
     hop2_keywords = [
         kw for kw in extract_bengali_keywords(hop1_text, top_k=12)
@@ -298,7 +317,6 @@ def retrieve_relevant_docs(question: str, k: int = 12) -> list[Document]:
         f"query: {question} {' '.join(hop2_keywords)}", k=4
     )
 
-    # Merge with strict per-chapter cap (max 2 chunks per chapter) and deduplication
     merged = []
     seen_fp = set()
     chapter_counts = Counter()
@@ -313,7 +331,6 @@ def retrieve_relevant_docs(question: str, k: int = 12) -> list[Document]:
         if len(merged) >= 9:
             break
 
-    # Present excerpts in chronological story order so the LLM follows plot reveals cleanly
     merged.sort(key=lambda d: d.metadata.get("chapter_num", 999))
     return merged
 
@@ -343,8 +360,12 @@ def format_docs(docs: list[Document]) -> str:
 
 
 def ask_book(question: str) -> dict:
-    if not API_KEY:
-        raise ValueError("API_KEY is not set. Add API_KEY=... to your .env file or environment.")
+    api_key = get_api_key()
+    base_url = get_base_url()
+    if not api_key:
+        raise ValueError(
+            "API_KEY is not set. Add API_KEY=... to .env (local) or App Settings -> Secrets (Streamlit Cloud)."
+        )
 
     retrieved_docs = retrieve_relevant_docs(question, k=12)
     context_text = format_docs(retrieved_docs)
@@ -362,12 +383,12 @@ def ask_book(question: str) -> dict:
         try:
             llm = ChatOpenAI(
                 model=model_name,
-                api_key=API_KEY,
-                base_url=BASE_URL,
+                api_key=api_key,
+                base_url=base_url,
                 temperature=0.0,
-                max_tokens=1536,
+                max_tokens=4096,
                 max_retries=1,
-                timeout=45,
+                timeout=60,
             )
             response = llm.invoke(messages)
             answer = (response.content or "").strip()
@@ -386,14 +407,12 @@ def ask_book(question: str) -> dict:
             }
 
         except AuthenticationError:
-            # Invalid API key applies to all models; fail immediately
             raise
         except RateLimitError as e:
             reason = "429 rate limit / token quota finished"
             errors.append(f"{model_name}: {reason} ({e})")
             mark_model_exhausted(model_name, reason)
         except APIStatusError as e:
-            # Covers 402 (credits exhausted), 403, 404, 500/502/503/529
             reason = f"HTTP {e.status_code}"
             errors.append(f"{model_name}: {reason} ({e})")
             mark_model_exhausted(model_name, reason)
