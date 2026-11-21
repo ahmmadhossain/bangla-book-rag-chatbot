@@ -8,7 +8,7 @@ st.set_page_config(
 )
 
 st.title("📚 দুর্গেশনন্দিনী (Durgeshnandini) — Knowledge Base Chatbot")
-st.caption("বঙ্কিমচন্দ্র চট্টোপাধ্যায়ের উপন্যাস ভিত্তিক RAG চ্যাটবট | Powered by LangChain, ChromaDB & Llama 3.2")
+st.caption("বঙ্কিমচন্দ্র চট্টোপাধ্যায়ের উপন্যাস ভিত্তিক RAG চ্যাটবট | Powered by LangChain and ChromaDB")
 
 with st.sidebar:
     st.header("বইয়ের তথ্য")
