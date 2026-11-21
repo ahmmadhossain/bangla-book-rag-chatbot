@@ -34,15 +34,16 @@ ONLY_FREE = os.getenv("ONLY_FREE", "false").strip().lower() == "true"
 # Highest-discount text models from CheaperInference (Free first, then highest % off)
 # Note: parallel-decisions-fast is excluded because it is a Decision-only model, not Text/Chat.
 HIGHEST_DISCOUNT_FALLBACK_MODELS = [
-    ("beam-free", 100.0),                    # Free
-    ("nemotron-3.5-lightning-free", 100.0),  # Free
+    ("beam-free", 30.0),                    # Free
+    ("nemotron-3.5-lightning-free", 30.0),  # Free
     ("deepseek-v4.1-flash-1017", 56.0),      # 56.00% off
     ("longcat-2.5", 64.0),                   # 64.00% off
     ("gpt-5.6-luna", 60.0),                  # 60.00% off
     ("gpt-5.6-terra", 60.0),                 # 60.00% off
-    ("flint-v1.0", 100.0),                   # Free
-    ("glyph-cluster", 100.0),                # Free
-    ("ampersand-v0.1", 100.0)                # Free
+    ("gpt-oss-120b", 60.0),                 # 60.00% off
+    ("flint-v1.0", 30.0),                   # Free
+    ("glyph-cluster", 30.0),                # Free
+    ("ampersand-v0.1", 30.0)                # Free
 ]
 
 NON_CHAT_KEYWORDS = (
